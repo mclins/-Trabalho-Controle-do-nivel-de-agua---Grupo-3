@@ -1,0 +1,1653 @@
+/*
+ * adc.c - Aquisicao do sensor de nivel por interrupcao de fim de conversao
+ *
+ * Referencia AVcc (5 V): o MPX5010 e raciometrico (Vout proporcional a
+ * Vs), entao usar a propria alimentacao como referencia cancela, na
+ * razao Vout/Vref, as variacoes da fonte.
+ *
+ * Clock do ADC = 16 MHz / 128 = 125 kHz (dentro de 50-200 kHz exigidos
+ * para 10 bits); conversao = 13 ciclos = 104 us.
+ */
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include "config.h"
+#include "adc.h"
+
+static volatile uint16_t soma;              /* soma das ultimas N amostras */
+static volatile uint16_t ultima;
+static volatile uint8_t  pronto;
+static uint16_t janela[ADC_MEDIA_N];
+static uint8_t  idx;
+
+void adc_init(void)
+{
+    ADMUX  = (1 << REFS0) | (ADC_CANAL & 0x0F);          /* AVcc, ajuste a direita */
+    DIDR0  = (1 << ADC0D);                               /* desliga buffer digital do pino */
+    ADCSRA = (1 << ADEN) | (1 << ADIE) |
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); /* prescaler 128 */
+    /* conversoes disparadas pela ISR do Timer1 (timer.c) */
+}
+
+ISR(ADC_vect)
+{
+    uint16_t v = ADC;                       /* le ADCL e depois ADCH */
+    ultima = v;
+
+    if (!pronto) {
+        /* primeira amostra preenche a janela inteira: evita que a media
+         * comece em zero e seja interpretada como sensor desconectado */
+        for (uint8_t i = 0; i < ADC_MEDIA_N; i++)
+            janela[i] = v;
+        soma = (uint16_t)(v * ADC_MEDIA_N);
+        pronto = 1;
+        return;
+    }
+    /* media movel recursiva: soma += nova - mais_antiga  (O(1)) */
+    soma = (uint16_t)(soma + v - janela[idx]);
+    janela[idx] = v;
+    idx = (uint8_t)((idx + 1) & (ADC_MEDIA_N - 1));
+}
+
+uint16_t adc_soma(void)
+{
+    uint16_t s;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {     /* leitura de 16 bits atomica */
+        s = soma;
+    }
+    return s;
+}
+
+uint16_t adc_ultima(void)
+{
+    uint16_t u;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        u = ultima;
+    }
+    return u;
+}
+
+uint8_t adc_pronto(void)
+{
+    return pronto;
+}
+
+#ifndef ADC_H
+#define ADC_H
+
+#include <stdint.h>
+
+void     adc_init(void);
+uint16_t adc_soma(void);     /* soma das ultimas 32 amostras (0..32736) */
+uint16_t adc_ultima(void);   /* ultima amostra bruta (0..1023)          */
+uint8_t  adc_pronto(void);   /* 1 apos a primeira conversao             */
+
+#endif
+
+/*
+ * board.h - Mapeamento de pinos e acesso direto aos registradores de E/S
+ *
+ * Pino         Funcao                      Arduino Uno
+ * PC0/ADC0     sensor de nivel (analogico)  A0
+ * PD0/RXD      USART RX                     D0
+ * PD1/TXD      USART TX                     D1
+ * PD2          botao "reconhecer alarme"    D2   (pull-up interno, ativo em 0)
+ * PB0          rele da bomba (via NPN)      D8   (ativo em 1)
+ * PB1          buzzer ativo (via NPN)       D9   (ativo em 1)
+ * PB2          LED vermelho - alarme        D10
+ * PB3          LED verde   - bomba ligada   D11
+ * PB5          LED de vida (heartbeat)      D13  (LED da placa)
+ */
+#ifndef BOARD_H
+#define BOARD_H
+
+#include <avr/io.h>
+
+#define PINO_BOMBA      PB0
+#define PINO_BUZZER     PB1
+#define PINO_LED_ALARME PB2
+#define PINO_LED_BOMBA  PB3
+#define PINO_LED_VIDA   PB5
+#define PINO_BOTAO      PD2
+
+#define SAIDAS_PORTB    ((1 << PINO_BOMBA) | (1 << PINO_BUZZER) | \
+                         (1 << PINO_LED_ALARME) | (1 << PINO_LED_BOMBA) | \
+                         (1 << PINO_LED_VIDA))
+
+static inline void board_init(void)
+{
+    PORTB &= (uint8_t)~SAIDAS_PORTB;        /* tudo desligado antes de virar saida */
+    DDRB  |= SAIDAS_PORTB;
+    DDRD  &= (uint8_t)~(1 << PINO_BOTAO);   /* entrada */
+    PORTD |= (1 << PINO_BOTAO);             /* pull-up interno */
+}
+
+static inline void saida(uint8_t pino, uint8_t ligado)
+{
+    if (ligado) PORTB |= (uint8_t)(1 << pino);
+    else        PORTB &= (uint8_t)~(1 << pino);
+}
+
+static inline void saida_inverte(uint8_t pino)
+{
+    PINB = (uint8_t)(1 << pino);            /* escrever 1 em PINx inverte PORTx */
+}
+
+static inline uint8_t botao_pressionado(void)
+{
+    return (PIND & (1 << PINO_BOTAO)) == 0;
+}
+
+#endif /* BOARD_H */
+
+/*
+ * config.h - Constantes de compilacao do sistema de controle de nivel
+ *
+ * ENGC50 - Sistemas Microprocessados - UFBA - 2026.2
+ * Problema 2: Controle inteligente de nivel de agua (ATmega328P)
+ */
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#define FW_VERSAO       "1.0"
+
+#ifndef F_CPU
+#define F_CPU           16000000UL      /* cristal de 16 MHz (Arduino Uno) */
+#endif
+
+/* ---------------- Comunicacao serial ---------------- */
+#define UART_BAUD       38400UL         /* 8N1, modo U2X (erro de 0,2 %) */
+#define UART_RX_TAM     64u             /* potencia de 2 */
+#define UART_TX_TAM     256u            /* indice de 8 bits: volta sozinho */
+
+/* ---------------- Base de tempo ---------------- */
+#define TICK_HZ         100u            /* Timer1 em CTC: interrupcao a cada 10 ms */
+#define PASSO_HZ        10u             /* logica de controle a cada 100 ms */
+#define TICKS_POR_PASSO (TICK_HZ / PASSO_HZ)
+#define PASSOS_POR_S    PASSO_HZ
+
+/* ---------------- Aquisicao ---------------- */
+#define ADC_CANAL       0u              /* PC0 / ADC0 (pino A0 do Uno) */
+#define ADC_MEDIA_LOG2  5u              /* media movel de 2^5 = 32 amostras */
+#define ADC_MEDIA_N     (1u << ADC_MEDIA_LOG2)
+
+/* ---------------- Botao ---------------- */
+#define BOTAO_DEBOUNCE  5u              /* 5 x 10 ms = 50 ms estavel */
+
+#endif /* CONFIG_H */
+
+/*
+ * controle.c - Controle liga/desliga com histerese e deteccao de falhas
+ *
+ * Executado a cada 100 ms. Todas as temporizacoes sao contadas em passos
+ * de 100 ms; os parametros (em segundos) sao convertidos aqui.
+ */
+#include "controle.h"
+
+#define SAT_INC16(x) do { if ((x) < 0xFFFFu) (x)++; } while (0)
+#define SAT_INC32(x) do { if ((x) < 0xFFFFFFFFul) (x)++; } while (0)
+
+/* Retorna true quando 'cond' permaneceu verdadeira por pelo menos 'n'
+ * passos consecutivos. E o filtro temporal que impede que uma onda na
+ * superficie ou um pico de ruido provoque uma transicao. */
+static bool confirma(uint16_t *cont, bool cond, uint16_t n)
+{
+    if (!cond) {
+        *cont = 0;
+        return false;
+    }
+    SAT_INC16(*cont);
+    return *cont >= n;
+}
+
+/* ------------------------------------------------------------------ */
+/* Conversao ADC -> nivel                                              */
+/* ------------------------------------------------------------------ */
+/* Reta por dois pontos de calibracao (adc_zero -> 0 mm, adc_ref -> n_ref).
+ * A entrada e a SOMA de 32 amostras: usar a soma (e nao a media
+ * truncada) preserva a resolucao extra obtida pela sobreamostragem. */
+int16_t ctrl_nivel_mm(const params_t *p, uint16_t adc_x32)
+{
+    int32_t num = ((int32_t)adc_x32 - (int32_t)CTRL_SOBREAMOSTRA * p->adc_zero) *
+                  (int32_t)p->n_ref;
+    int32_t den = (int32_t)CTRL_SOBREAMOSTRA * ((int32_t)p->adc_ref - (int32_t)p->adc_zero);
+    int32_t q;
+
+    if (den == 0)
+        return 0;
+    if (den < 0) {               /* sensor com inclinacao negativa */
+        den = -den;
+        num = -num;
+    }
+    if (num >= 0) q = (num + den / 2) / den;     /* arredondamento */
+    else          q = -((-num + den / 2) / den);
+
+    if (q < 0)     q = 0;
+    if (q > 32767) q = 32767;
+    return (int16_t)q;
+}
+
+uint8_t ctrl_percentual(const params_t *p, int16_t nivel_mm)
+{
+    int32_t pc;
+    if (nivel_mm <= 0 || p->altura == 0)
+        return 0;
+    pc = ((int32_t)nivel_mm * 100 + p->altura / 2) / p->altura;
+    return (uint8_t)(pc > 255 ? 255 : pc);
+}
+
+/* ------------------------------------------------------------------ */
+/* Transicoes                                                          */
+/* ------------------------------------------------------------------ */
+static void liga(ctrl_t *c, motivo_t m)
+{
+    c->bomba     = true;
+    c->estado    = EST_LIGADA;
+    c->motivo    = m;
+    c->t_ligada  = 0;
+    c->t_janela  = 0;
+    c->nivel_ref = c->nivel_mm;
+    c->c_desl    = 0;
+}
+
+static void desliga(ctrl_t *c, motivo_t m)
+{
+    c->bomba       = false;
+    c->estado      = EST_DESLIGADA;
+    c->motivo      = m;
+    c->t_desligada = 0;
+    c->t_janela    = 0;
+    c->nivel_ref   = c->nivel_mm;
+    c->c_liga      = 0;
+}
+
+static void entra_falha(ctrl_t *c)
+{
+    c->estado     = EST_FALHA;
+    c->t_falha    = 0;
+    c->cmd_manual = false;
+}
+
+/* Com a bomba desligada o nivel so pode cair ou ficar parado. Uma subida
+ * maior que sub_min dentro da janela indica entrada indevida de agua:
+ * contato do rele soldado, bomba acionada por outro circuito, etc. */
+static void janela_desligada(ctrl_t *c, const params_t *p)
+{
+    if ((int32_t)c->nivel_mm - c->nivel_ref >= (int32_t)p->sub_min)
+        c->alarmes |= AL_INDEVIDO;
+    c->nivel_ref = c->nivel_mm;
+    c->t_janela  = 0;
+}
+
+/* ------------------------------------------------------------------ */
+void ctrl_init(ctrl_t *c)
+{
+    *c = (ctrl_t){0};
+    c->modo   = MODO_AUTO;
+    c->estado = EST_DESLIGADA;
+    c->motivo = MOT_NENHUM;
+    /* t_desligada = 0: o tempo minimo desligada tambem vale apos a
+     * energizacao (partida retardada), o que da tempo do filtro do ADC
+     * se estabilizar e evita religar o motor logo apos uma queda de energia. */
+}
+
+void ctrl_passo(ctrl_t *c, const params_t *p, uint16_t adc_x32)
+{
+    const uint16_t n_conf = (uint16_t)(p->t_conf * CTRL_PASSOS_POR_S);
+    const uint32_t n_jan  = (uint32_t)p->janela * CTRL_PASSOS_POR_S;
+    uint16_t adc = (uint16_t)((adc_x32 + CTRL_SOBREAMOSTRA / 2) / CTRL_SOBREAMOSTRA);
+    bool invalido, sensor_ok, fim_janela;
+
+    SAT_INC32(c->passos);
+    c->adc = adc;
+
+    /* 1) Plausibilidade eletrica do sensor ----------------------------- */
+    invalido = (adc < p->adc_fmin) || (adc > p->adc_fmax);
+    if (confirma(&c->c_sens_ruim, invalido, CTRL_SENSOR_FALHA))
+        c->alarmes |= AL_SENSOR;
+    if (confirma(&c->c_sens_bom, !invalido, CTRL_SENSOR_OK))
+        c->alarmes &= (uint8_t)~AL_SENSOR;
+    sensor_ok = !invalido && !(c->alarmes & AL_SENSOR);
+
+    /* 2) Nivel e alarmes de nivel critico (confirmacao + histerese) ---- */
+    if (sensor_ok) {
+        int16_t n = ctrl_nivel_mm(p, adc_x32);
+        c->nivel_mm = n;
+        if (confirma(&c->c_ca_on, n >= (int32_t)p->n_crit_a, n_conf))
+            c->alarmes |= AL_CRIT_ALTO;
+        if (confirma(&c->c_ca_off, n < (int32_t)p->n_crit_a - CTRL_HIST_ALARME_MM, n_conf))
+            c->alarmes &= (uint8_t)~AL_CRIT_ALTO;
+        if (confirma(&c->c_cb_on, n <= (int32_t)p->n_crit_b, n_conf))
+            c->alarmes |= AL_CRIT_BAIXO;
+        if (confirma(&c->c_cb_off, n > (int32_t)p->n_crit_b + CTRL_HIST_ALARME_MM, n_conf))
+            c->alarmes &= (uint8_t)~AL_CRIT_BAIXO;
+    } else {
+        c->c_ca_on = c->c_ca_off = c->c_cb_on = c->c_cb_off = 0;
+    }
+
+    /* 3) Temporizadores ------------------------------------------------ */
+    if (c->bomba) SAT_INC32(c->t_ligada);
+    else          SAT_INC32(c->t_desligada);
+    SAT_INC32(c->t_janela);
+    if (!sensor_ok)
+        c->t_janela = 0;                 /* janela reinicia quando o sensor volta */
+    else if (c->t_janela == 1)
+        c->nivel_ref = c->nivel_mm;      /* primeiro passo de uma nova janela */
+    fim_janela = sensor_ok && p->janela && c->t_janela >= n_jan;
+
+    /* 4) Maquina de estados da bomba ----------------------------------- */
+    switch (c->estado) {
+    case EST_DESLIGADA:
+        if (fim_janela)
+            janela_desligada(c, p);
+        if (!sensor_ok || (c->alarmes & AL_CRIT_ALTO)) {
+            c->c_liga = 0;
+            c->cmd_manual = false;
+            break;
+        }
+        if (c->modo == MODO_AUTO) {
+            bool baixo = confirma(&c->c_liga, c->nivel_mm <= (int32_t)p->n_liga, n_conf);
+            if (baixo && c->t_desligada >= (uint32_t)p->t_minoff * CTRL_PASSOS_POR_S)
+                liga(c, MOT_NIVEL_BAIXO);
+        } else {
+            c->c_liga = 0;
+            if (c->cmd_manual)
+                liga(c, MOT_MANUAL);
+        }
+        break;
+
+    case EST_LIGADA:
+        /* intertravamentos: valem nos modos automatico e manual */
+        if (!sensor_ok) {
+            desliga(c, MOT_SENSOR);
+            c->cmd_manual = false;
+            break;
+        }
+        if (c->alarmes & AL_CRIT_ALTO) {
+            desliga(c, MOT_CRIT_ALTO);
+            c->cmd_manual = false;
+            break;
+        }
+        if (c->modo == MODO_AUTO) {
+            if (confirma(&c->c_desl, c->nivel_mm >= (int32_t)p->n_desl, n_conf)) {
+                desliga(c, MOT_NIVEL_ALTO);
+                c->tentativas = 0;               /* enchimento completo */
+                c->alarmes &= (uint8_t)~AL_ABAST;
+                break;
+            }
+        } else if (!c->cmd_manual) {
+            desliga(c, MOT_MANUAL);
+            break;
+        }
+        /* protecao: tempo maximo de funcionamento continuo */
+        if (p->t_max && c->t_ligada >= (uint32_t)p->t_max * CTRL_PASSOS_POR_S) {
+            desliga(c, MOT_TMAX);
+            c->alarmes |= AL_TMAX;
+            entra_falha(c);
+            break;
+        }
+        /* protecao: a bomba ligada precisa fazer o nivel subir */
+        if (fim_janela) {
+            if ((int32_t)c->nivel_mm - c->nivel_ref < (int32_t)p->sub_min) {
+                desliga(c, MOT_ABAST);
+                c->alarmes |= AL_ABAST;
+                if (c->tentativas < 255) c->tentativas++;
+                if (c->tentativas > p->n_retry)
+                    c->alarmes |= AL_BLOQUEIO;
+                entra_falha(c);
+            } else {
+                c->alarmes &= (uint8_t)~AL_ABAST;   /* abastecimento normalizado */
+                c->nivel_ref = c->nivel_mm;
+                c->t_janela  = 0;
+            }
+        }
+        break;
+
+    case EST_FALHA:
+        SAT_INC32(c->t_falha);
+        if (fim_janela)
+            janela_desligada(c, p);
+        /* falha de abastecimento: nova tentativa automatica apos t_retry,
+         * ate n_retry vezes. Tempo maximo e bloqueio exigem o operador. */
+        if (!(c->alarmes & (AL_TMAX | AL_BLOQUEIO)) &&
+            c->t_falha >= (uint32_t)p->t_retry * CTRL_PASSOS_POR_S) {
+            c->estado = EST_DESLIGADA;
+            c->motivo = MOT_NOVA_TENTATIVA;
+        }
+        break;
+    }
+
+    /* 5) Sinalizacao: qualquer alarme novo reativa o buzzer ------------- */
+    if (c->alarmes & (uint8_t)~c->alarmes_ant)
+        c->silenciado = false;
+    c->alarmes_ant = c->alarmes;
+    c->buzzer = (c->alarmes != 0) && !c->silenciado;
+}
+
+void ctrl_reconhece(ctrl_t *c)
+{
+    c->alarmes    &= (uint8_t)~AL_TRAVADOS;
+    c->alarmes_ant = c->alarmes;
+    c->tentativas  = 0;
+    c->silenciado  = true;
+    c->buzzer      = false;
+    if (c->estado == EST_FALHA) {
+        c->estado = EST_DESLIGADA;
+        c->motivo = MOT_RECONHECIDO;
+    }
+}
+
+void ctrl_modo(ctrl_t *c, modo_t m)
+{
+    if (m == c->modo)
+        return;
+    c->modo = m;
+    /* transferencia sem solavanco: ao entrar no manual mantem o estado atual */
+    c->cmd_manual = (m == MODO_MANUAL) ? c->bomba : false;
+    c->c_liga = c->c_desl = 0;
+}
+
+bool ctrl_bomba_manual(ctrl_t *c, bool ligar)
+{
+    if (c->modo != MODO_MANUAL)
+        return false;
+    if (ligar && (c->estado == EST_FALHA || (c->alarmes & (AL_SENSOR | AL_CRIT_ALTO))))
+        return false;
+    c->cmd_manual = ligar;
+    return true;
+}
+
+/*
+ * controle.h - Logica de controle da bomba e deteccao de falhas.
+ *
+ * Modulo independente de hardware: recebe a leitura media do ADC a cada
+ * passo de 100 ms e decide o estado da bomba e dos alarmes. Por nao
+ * acessar registradores, e testado no PC (test/host) e reutilizado sem
+ * alteracao no firmware.
+ */
+#ifndef CONTROLE_H
+#define CONTROLE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "params.h"
+
+#define CTRL_PASSOS_POR_S   10u     /* ctrl_passo() chamado a 10 Hz       */
+#define CTRL_SOBREAMOSTRA   32u     /* entrada = soma de 32 amostras ADC  */
+#define CTRL_SENSOR_FALHA   10u     /* 1 s invalido -> alarme de sensor   */
+#define CTRL_SENSOR_OK      30u     /* 3 s valido   -> limpa o alarme     */
+#define CTRL_HIST_ALARME_MM 10      /* histerese dos alarmes criticos (mm) */
+
+/* Bits de alarme */
+#define AL_SENSOR     0x01u  /* leitura fora da faixa eletrica do sensor    */
+#define AL_CRIT_BAIXO 0x02u  /* nivel criticamente baixo                    */
+#define AL_CRIT_ALTO  0x04u  /* nivel criticamente alto (risco de transbordo)*/
+#define AL_ABAST      0x08u  /* bomba ligada sem subida de nivel (fonte seca,
+                                bomba/tubulacao com defeito)                 */
+#define AL_TMAX       0x10u  /* bomba ligada alem do tempo maximo           */
+#define AL_BLOQUEIO   0x20u  /* tentativas esgotadas: exige reconhecimento  */
+#define AL_INDEVIDO   0x40u  /* nivel subindo com a bomba desligada
+                                (rele colado, valvula/entrada indevida)      */
+#define AL_TRAVADOS   (AL_ABAST | AL_TMAX | AL_BLOQUEIO | AL_INDEVIDO)
+#define AL_N          7u
+
+typedef enum { MODO_AUTO = 0, MODO_MANUAL = 1 } modo_t;
+
+typedef enum {
+    EST_DESLIGADA = 0,   /* aguardando nivel baixo                      */
+    EST_LIGADA,          /* enchendo                                    */
+    EST_FALHA            /* bomba bloqueada por falha de abastecimento  */
+} estado_t;
+
+typedef enum {
+    MOT_NENHUM = 0,
+    MOT_NIVEL_BAIXO,     /* liga: nivel <= n_liga                        */
+    MOT_NIVEL_ALTO,      /* desliga: nivel >= n_desl                     */
+    MOT_MANUAL,          /* comando do operador                          */
+    MOT_SENSOR,          /* desliga por falha do sensor                  */
+    MOT_CRIT_ALTO,       /* desliga por nivel critico alto               */
+    MOT_ABAST,           /* desliga por falha de abastecimento           */
+    MOT_TMAX,            /* desliga por tempo maximo                     */
+    MOT_NOVA_TENTATIVA,  /* sai do estado de falha apos t_retry          */
+    MOT_RECONHECIDO      /* sai do estado de falha por reconhecimento    */
+} motivo_t;
+
+typedef struct {
+    /* saidas e estado observavel */
+    modo_t   modo;
+    estado_t estado;
+    bool     bomba;          /* comando do rele                          */
+    bool     buzzer;         /* ha alarme nao reconhecido                */
+    uint8_t  alarmes;
+    uint8_t  tentativas;
+    motivo_t motivo;         /* motivo da ultima transicao da bomba      */
+    int16_t  nivel_mm;       /* ultima estimativa valida                 */
+    uint16_t adc;            /* media do ADC (LSB)                       */
+    uint32_t passos;         /* tempo desde o boot, em passos de 100 ms  */
+
+    /* estado interno */
+    bool     cmd_manual;
+    bool     silenciado;
+    uint8_t  alarmes_ant;
+    uint16_t c_liga, c_desl;             /* confirmacao dos limiares     */
+    uint16_t c_ca_on, c_ca_off;          /* critico alto                 */
+    uint16_t c_cb_on, c_cb_off;          /* critico baixo                */
+    uint16_t c_sens_ruim, c_sens_bom;
+    uint32_t t_ligada, t_desligada, t_janela, t_falha;
+    int16_t  nivel_ref;                  /* inicio da janela de subida   */
+} ctrl_t;
+
+void    ctrl_init(ctrl_t *c);
+void    ctrl_passo(ctrl_t *c, const params_t *p, uint16_t adc_x32);
+void    ctrl_reconhece(ctrl_t *c);
+void    ctrl_modo(ctrl_t *c, modo_t m);
+bool    ctrl_bomba_manual(ctrl_t *c, bool ligar);   /* false = recusado */
+int16_t ctrl_nivel_mm(const params_t *p, uint16_t adc_x32);
+uint8_t ctrl_percentual(const params_t *p, int16_t nivel_mm);
+
+#endif /* CONTROLE_H */
+
+/*
+ * main.c - Sistema inteligente de controle de nivel de agua (ATmega328P)
+ *
+ * ENGC50 - Sistemas Microprocessados - UFBA - 2026.2 - Problema 2
+ *
+ * Organizacao das tarefas (primeiro plano / segundo plano):
+ *
+ *   ISR TIMER1_COMPA (10 ms) -> dispara ADC, debounce do botao, conta passos
+ *   ISR ADC                  -> media movel de 32 amostras
+ *   ISR USART_RX / UDRE      -> buffers circulares de recepcao/transmissao
+ *
+ *   laco principal           -> comandos seriais, controle (100 ms),
+ *                               saidas, eventos, telemetria; dorme (IDLE)
+ *                               quando nao ha trabalho
+ *
+ * Nenhuma tarefa espera ativamente por outra: cada ISR e curta e o laco
+ * principal so processa o que ja esta pronto.
+ */
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include "config.h"
+#include "board.h"
+#include "timer.h"
+#include "adc.h"
+#include "uart.h"
+#include "params.h"
+#include "controle.h"
+#include "protocolo.h"
+
+static params_t P;
+static ctrl_t   C;
+
+/* Causa do reset: MCUSR precisa ser lido e zerado logo no inicio, antes
+ * de main(), e o watchdog desligado; senao um reset por watchdog vira um
+ * laco de resets (o WDT continua ativo apos o reset). */
+static uint8_t mcusr_copia __attribute__((section(".noinit")));
+void le_mcusr(void) __attribute__((naked, used, section(".init3")));
+void le_mcusr(void)
+{
+    mcusr_copia = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
+}
+
+void app_salvar(void)
+{
+    params_salva(&P);
+}
+
+uint8_t app_carregar(void)
+{
+    return params_carrega(&P);
+}
+
+/* Padrao do buzzer e dos LEDs, avaliado a cada 100 ms */
+static void atualiza_saidas(void)
+{
+    static uint8_t fase;                    /* 0..9: ciclo de 1 s */
+    fase = (uint8_t)((fase + 1u) % 10u);
+
+    saida(PINO_BOMBA, C.bomba);
+    saida(PINO_LED_BOMBA, C.bomba);
+    saida(PINO_LED_ALARME, C.alarmes != 0);
+
+    /* falhas que bloqueiam a bomba: bipe 0,5 s ligado / 0,5 s desligado;
+     * avisos (nivel critico, entrada indevida): bipe curto de 0,2 s */
+    uint8_t grave = C.alarmes & (AL_SENSOR | AL_ABAST | AL_TMAX | AL_BLOQUEIO | AL_CRIT_ALTO);
+    uint8_t bip   = grave ? (fase < 5) : (fase < 2);
+    saida(PINO_BUZZER, C.buzzer && bip);
+
+    if (fase == 0)
+        saida_inverte(PINO_LED_VIDA);       /* pisca: firmware vivo */
+}
+
+int main(void)
+{
+    uint8_t da_eeprom;
+
+    board_init();
+    da_eeprom = params_carrega(&P);
+    ctrl_init(&C);
+    uart_init();
+    adc_init();
+    timer_init();
+    prot_init(&P, &C);
+
+    set_sleep_mode(SLEEP_MODE_IDLE);        /* timers, ADC e USART seguem ativos */
+    wdt_enable(WDTO_1S);
+    sei();
+
+    prot_boot(mcusr_copia & 0x0F, da_eeprom);
+
+    for (;;) {
+        int ch;
+
+        wdt_reset();
+
+        while ((ch = uart_getc()) >= 0)
+            prot_rx((char)ch);
+        if (uart_estouro_rx())
+            uart_puts_P(PSTR("ERRO: estouro do buffer de recepcao\r\n"));
+
+        while (timer_pega_passo()) {
+            if (adc_pronto())
+                ctrl_passo(&C, &P, adc_soma());
+            atualiza_saidas();
+            prot_pos_passo();
+        }
+
+        if (timer_pega_botao())
+            prot_botao();
+
+        /* Dorme ate a proxima interrupcao. As interrupcoes sao desligadas
+         * para testar se ha trabalho; sei seguido de sleep e atomico no
+         * AVR, entao uma interrupcao entre o teste e o sleep nao se perde. */
+        cli();
+        if (!timer_ha_trabalho()) {
+            sleep_enable();
+            sei();
+            sleep_cpu();
+            sleep_disable();
+        }
+        sei();
+    }
+}
+
+/*
+ * params.c - Valores padrao, validacao e persistencia dos parametros
+ */
+#include "params.h"
+
+#ifdef __AVR__
+#include <avr/eeprom.h>
+#endif
+
+/*
+ * Valores padrao para um reservatorio de teste com 500 mm de altura util
+ * e sensor MPX5010DP alimentado com 5 V (curva nominal do datasheet):
+ *   Vout = Vs (0,09 P + 0,04),  P em kPa,  P = rho g h
+ *   h = 0      -> 0,200 V -> ADC =  41
+ *   h = 500 mm -> 2,407 V -> ADC = 493   (~0,9 LSB/mm)
+ */
+void params_padrao(params_t *p)
+{
+    p->n_liga   = 200;
+    p->n_desl   = 420;
+    p->n_crit_b = 80;
+    p->n_crit_a = 470;
+    p->altura   = 500;
+    p->adc_zero = 41;
+    p->adc_ref  = 493;
+    p->n_ref    = 500;
+    p->adc_fmin = 15;    /* ~73 mV: abaixo do offset minimo do sensor (88 mV) */
+    p->adc_fmax = 1010;  /* ~4,93 V: acima do fundo de escala do sensor (4,7 V) */
+    p->t_conf   = 2;
+    p->t_minoff = 10;
+    p->t_max    = 900;
+    p->janela   = 30;
+    p->sub_min  = 10;
+    p->t_retry  = 300;
+    p->n_retry  = 2;
+    p->telem    = 5;
+}
+
+param_erro_t params_valida(const params_t *p)
+{
+    if (!(p->n_crit_b < p->n_liga && p->n_liga < p->n_desl &&
+          p->n_desl < p->n_crit_a && p->n_crit_a <= p->altura))
+        return PARAM_ERR_ORDEM;
+
+    int16_t d = (int16_t)p->adc_ref - (int16_t)p->adc_zero;
+    if (d < 0) d = (int16_t)-d;
+    if (p->n_ref == 0 || d < 10 || p->adc_ref > 1023 || p->adc_zero > 1023)
+        return PARAM_ERR_CAL;
+
+    if (p->adc_fmin >= p->adc_fmax)
+        return PARAM_ERR_FAIXA_ADC;
+
+    if (p->janela > 0 && p->sub_min == 0)
+        return PARAM_ERR_JANELA;
+
+    return PARAM_OK;
+}
+
+uint16_t params_get(const params_t *p, uint8_t idx)
+{
+    return ((const uint16_t *)p)[idx];
+}
+
+void params_set(params_t *p, uint8_t idx, uint16_t v)
+{
+    ((uint16_t *)p)[idx] = v;
+}
+
+#ifdef __AVR__
+/* ------------------------------------------------------------------ */
+/* Bloco na EEPROM: [marca][versao][parametros][CRC-16]                */
+/* ------------------------------------------------------------------ */
+#define EE_MARCA 0xA55Au
+
+typedef struct {
+    uint16_t marca;
+    uint16_t versao;
+    params_t p;
+    uint16_t crc;
+} ee_bloco_t;
+
+static ee_bloco_t EEMEM ee_bloco;
+
+/* CRC-16/CCITT (polinomio 0x1021) */
+static uint16_t crc16(const uint8_t *d, uint16_t n)
+{
+    uint16_t crc = 0xFFFF;
+    while (n--) {
+        crc ^= (uint16_t)(*d++) << 8;
+        for (uint8_t i = 0; i < 8; i++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+uint8_t params_carrega(params_t *p)
+{
+    ee_bloco_t b;
+    eeprom_read_block(&b, &ee_bloco, sizeof b);
+    if (b.marca == EE_MARCA && b.versao == PARAMS_VERSAO &&
+        b.crc == crc16((const uint8_t *)&b.p, sizeof b.p) &&
+        params_valida(&b.p) == PARAM_OK) {
+        *p = b.p;
+        return 1;
+    }
+    params_padrao(p);
+    return 0;
+}
+
+void params_salva(const params_t *p)
+{
+    ee_bloco_t b;
+    b.marca  = EE_MARCA;
+    b.versao = PARAMS_VERSAO;
+    b.p      = *p;
+    b.crc    = crc16((const uint8_t *)&b.p, sizeof b.p);
+    /* eeprom_update_block so grava os bytes que mudaram: reduz desgaste
+     * (100 mil ciclos por celula) e tempo de escrita (~3,4 ms/byte). */
+    eeprom_update_block(&b, &ee_bloco, sizeof b);
+}
+#endif
+
+/*
+ * params.h - Parametros de operacao configuraveis pela serial e
+ * persistidos na EEPROM.
+ */
+#ifndef PARAMS_H
+#define PARAMS_H
+
+#include <stdint.h>
+
+/* Todos os campos sao uint16_t para permitir uma tabela generica de
+ * acesso (comando SET/PARAMS). A ordem dos campos define o layout na
+ * EEPROM: ao alterar, incremente PARAMS_VERSAO. */
+typedef struct {
+    uint16_t n_liga;     /* mm  - liga a bomba quando nivel <= n_liga        */
+    uint16_t n_desl;     /* mm  - desliga a bomba quando nivel >= n_desl     */
+    uint16_t n_crit_b;   /* mm  - alarme de nivel criticamente baixo         */
+    uint16_t n_crit_a;   /* mm  - alarme de nivel criticamente alto          */
+    uint16_t altura;     /* mm  - altura util do reservatorio (100 %)        */
+    uint16_t adc_zero;   /* LSB - leitura do ADC com o reservatorio vazio    */
+    uint16_t adc_ref;    /* LSB - leitura do ADC no nivel de referencia      */
+    uint16_t n_ref;      /* mm  - nivel de referencia da calibracao          */
+    uint16_t adc_fmin;   /* LSB - abaixo disso: sensor aberto/em curto p/ GND */
+    uint16_t adc_fmax;   /* LSB - acima disso: sensor em curto p/ VCC        */
+    uint16_t t_conf;     /* s   - tempo de confirmacao de cruzamento         */
+    uint16_t t_minoff;   /* s   - tempo minimo com a bomba desligada         */
+    uint16_t t_max;      /* s   - tempo maximo ligada (0 = desabilitado)     */
+    uint16_t janela;     /* s   - janela de verificacao de subida (0 = desab.) */
+    uint16_t sub_min;    /* mm  - subida minima esperada por janela          */
+    uint16_t t_retry;    /* s   - espera antes de nova tentativa             */
+    uint16_t n_retry;    /* -   - tentativas automaticas antes do bloqueio   */
+    uint16_t telem;      /* s   - periodo da telemetria (0 = desligada)      */
+} params_t;
+
+#define PARAMS_N        (sizeof(params_t) / sizeof(uint16_t))
+#define PARAMS_VERSAO   1u
+
+/* Codigos de validacao */
+typedef enum {
+    PARAM_OK = 0,
+    PARAM_ERR_ORDEM,     /* exige crit_b < liga < desl < crit_a <= altura */
+    PARAM_ERR_CAL,       /* calibracao degenerada                         */
+    PARAM_ERR_FAIXA_ADC, /* adc_fmin >= adc_fmax                          */
+    PARAM_ERR_JANELA     /* janela > 0 exige sub_min > 0                  */
+} param_erro_t;
+
+void         params_padrao(params_t *p);
+param_erro_t params_valida(const params_t *p);
+
+/* Acesso generico por indice (usado pelo interpretador de comandos) */
+uint16_t     params_get(const params_t *p, uint8_t idx);
+void         params_set(params_t *p, uint8_t idx, uint16_t v);
+
+#ifdef __AVR__
+/* Persistencia: retorna 1 se carregou da EEPROM, 0 se usou o padrao */
+uint8_t      params_carrega(params_t *p);
+void         params_salva(const params_t *p);
+#endif
+
+#endif /* PARAMS_H */
+
+/*
+ * pgm_compat.h - Permite compilar os modulos independentes de hardware
+ * tanto no AVR (strings na memoria de programa) quanto no PC (testes).
+ */
+#ifndef PGM_COMPAT_H
+#define PGM_COMPAT_H
+
+#ifdef __AVR__
+#include <avr/pgmspace.h>
+#else
+#include <string.h>
+#define PROGMEM
+#define PSTR(s)                 (s)
+#define pgm_read_byte(p)        (*(const unsigned char *)(p))
+#define pgm_read_word(p)        (*(const unsigned short *)(p))
+#define pgm_read_ptr(p)         (*(void * const *)(p))
+#define strcmp_P                strcmp
+#endif
+
+#endif /* PGM_COMPAT_H */
+
+/*
+ * protocolo.c - Interpretador de comandos, eventos e telemetria
+ *
+ * Todas as strings constantes ficam na memoria de programa (PSTR /
+ * PROGMEM): o ATmega328P tem so 2 KiB de SRAM.
+ */
+#include <stdbool.h>
+#include "protocolo.h"
+#include "uart.h"
+#include "pgm_compat.h"
+#include "config.h"
+
+static params_t *P;
+static ctrl_t   *C;
+
+static char    linha[PROT_LINHA_MAX + 1];
+static uint8_t tam;
+static bool    descartando;
+
+/* estado anterior, para gerar eventos so nas mudancas */
+static bool     ant_bomba;
+static estado_t ant_estado;
+static uint8_t  ant_alarmes;
+static uint32_t prox_telem;
+
+/* ------------------------------------------------------------------ */
+/* Tabelas na flash                                                    */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    char     nome[8];
+    char     unid[4];
+    uint16_t max;
+} pdesc_t;
+
+/* Mesma ordem dos campos de params_t */
+static const pdesc_t PDESC[PARAMS_N] PROGMEM = {
+    {"LIGA",    "mm",  30000}, {"DESLIGA", "mm",  30000},
+    {"CRITB",   "mm",  30000}, {"CRITA",   "mm",  30000},
+    {"ALTURA",  "mm",  30000}, {"ADCZERO", "LSB",  1023},
+    {"ADCREF",  "LSB",  1023}, {"NREF",    "mm",  30000},
+    {"ADCMIN",  "LSB",  1023}, {"ADCMAX",  "LSB",  1023},
+    {"TCONF",   "s",     600}, {"TMINOFF", "s",    3600},
+    {"TMAX",    "s",   65535}, {"JANELA",  "s",    3600},
+    {"SUBMIN",  "mm",  30000}, {"TRETRY",  "s",   65535},
+    {"NRETRY",  "",       20}, {"TELEM",   "s",    3600},
+};
+
+static const char s_al0[] PROGMEM = "SENSOR";
+static const char s_al1[] PROGMEM = "CRIT_BAIXO";
+static const char s_al2[] PROGMEM = "CRIT_ALTO";
+static const char s_al3[] PROGMEM = "ABAST";
+static const char s_al4[] PROGMEM = "TMAX";
+static const char s_al5[] PROGMEM = "BLOQUEIO";
+static const char s_al6[] PROGMEM = "INDEVIDO";
+static const char * const NOME_AL[AL_N] PROGMEM = {
+    s_al0, s_al1, s_al2, s_al3, s_al4, s_al5, s_al6
+};
+
+static const char s_mo0[] PROGMEM = "-";
+static const char s_mo1[] PROGMEM = "NIVEL_BAIXO";
+static const char s_mo2[] PROGMEM = "NIVEL_ALTO";
+static const char s_mo3[] PROGMEM = "MANUAL";
+static const char s_mo4[] PROGMEM = "SENSOR";
+static const char s_mo5[] PROGMEM = "CRIT_ALTO";
+static const char s_mo6[] PROGMEM = "ABAST";
+static const char s_mo7[] PROGMEM = "TMAX";
+static const char s_mo8[] PROGMEM = "NOVA_TENTATIVA";
+static const char s_mo9[] PROGMEM = "RECONHECIDO";
+static const char * const NOME_MOT[] PROGMEM = {
+    s_mo0, s_mo1, s_mo2, s_mo3, s_mo4, s_mo5, s_mo6, s_mo7, s_mo8, s_mo9
+};
+
+static const char s_es0[] PROGMEM = "DESLIGADA";
+static const char s_es1[] PROGMEM = "LIGADA";
+static const char s_es2[] PROGMEM = "FALHA";
+static const char * const NOME_EST[] PROGMEM = { s_es0, s_es1, s_es2 };
+
+static const char AJUDA[] PROGMEM =
+    "Comandos:\r\n"
+    "  STATUS (S)            estado atual\r\n"
+    "  PARAMS (P)            lista parametros\r\n"
+    "  SET <nome> <v> [...]  ate 6 pares, validados em conjunto\r\n"
+    "  CAL ZERO | CAL <mm>   calibra com o nivel atual\r\n"
+    "  MODO AUTO | MANUAL\r\n"
+    "  BOMBA LIGA | DESL     (somente no modo manual)\r\n"
+    "  ACK                   reconhece alarmes / libera bloqueio\r\n"
+    "  SALVAR | CARREGAR | PADRAO   EEPROM\r\n"
+    "  VERSAO | AJUDA (?)\r\n";
+
+/* ------------------------------------------------------------------ */
+/* Auxiliares de saida                                                 */
+/* ------------------------------------------------------------------ */
+static void ok(void)                 { uart_puts_P(PSTR("OK\r\n")); }
+static void erro(const char *msg_P)  { uart_puts_P(PSTR("ERRO: ")); uart_puts_P(msg_P); uart_nl(); }
+
+static void puts_tab(const char * const *tab, uint8_t i)
+{
+    uart_puts_P((const char *)pgm_read_ptr(&tab[i]));
+}
+
+static void put_alarmes(uint8_t a)
+{
+    if (!a) {
+        uart_puts_P(PSTR("nenhum"));
+        return;
+    }
+    bool primeiro = true;
+    for (uint8_t i = 0; i < AL_N; i++) {
+        if (a & (1u << i)) {
+            if (!primeiro) uart_putc(' ');
+            puts_tab(NOME_AL, i);
+            primeiro = false;
+        }
+    }
+}
+
+static void put_tempo(void)
+{
+    uart_putd1(C->passos);              /* passos de 100 ms -> segundos */
+}
+
+static void put_nome_param(uint8_t i)
+{
+    uart_puts_P(PDESC[i].nome);
+}
+
+static void msg_validacao(param_erro_t e)
+{
+    switch (e) {
+    case PARAM_ERR_ORDEM:     erro(PSTR("exige CRITB < LIGA < DESLIGA < CRITA <= ALTURA")); break;
+    case PARAM_ERR_CAL:       erro(PSTR("calibracao invalida (ADCREF-ADCZERO >= 10 LSB, NREF > 0)")); break;
+    case PARAM_ERR_FAIXA_ADC: erro(PSTR("exige ADCMIN < ADCMAX")); break;
+    case PARAM_ERR_JANELA:    erro(PSTR("JANELA > 0 exige SUBMIN > 0")); break;
+    default: break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Analise lexica                                                      */
+/* ------------------------------------------------------------------ */
+static bool num_u16(const char *s, uint16_t *v)
+{
+    uint32_t acc = 0;
+    if (!*s)
+        return false;
+    while (*s) {
+        if (*s < '0' || *s > '9')
+            return false;
+        acc = acc * 10u + (uint32_t)(*s - '0');
+        if (acc > 65535u)
+            return false;
+        s++;
+    }
+    *v = (uint16_t)acc;
+    return true;
+}
+
+static bool igual(const char *tok, const char *lit_P)
+{
+    return strcmp_P(tok, lit_P) == 0;
+}
+
+static int8_t acha_param(const char *tok)
+{
+    for (uint8_t i = 0; i < PARAMS_N; i++)
+        if (strcmp_P(tok, PDESC[i].nome) == 0)
+            return (int8_t)i;
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Comandos                                                            */
+/* ------------------------------------------------------------------ */
+static void cmd_status(void)
+{
+    uart_puts_P(PSTR("Nivel: "));    uart_puti(C->nivel_mm);
+    uart_puts_P(PSTR(" mm ("));      uart_putu(ctrl_percentual(P, C->nivel_mm));
+    uart_puts_P(PSTR(" %)  ADC: ")); uart_putu(C->adc); uart_nl();
+    uart_puts_P(PSTR("Bomba: "));    uart_puts_P(C->bomba ? PSTR("LIGADA") : PSTR("DESLIGADA"));
+    uart_puts_P(PSTR("  Estado: ")); puts_tab(NOME_EST, (uint8_t)C->estado);
+    uart_puts_P(PSTR("  Modo: "));   uart_puts_P(C->modo == MODO_AUTO ? PSTR("AUTO") : PSTR("MANUAL"));
+    uart_nl();
+    uart_puts_P(PSTR("Alarmes: "));  put_alarmes(C->alarmes);
+    uart_puts_P(PSTR("  Tentativas: ")); uart_putu(C->tentativas); uart_nl();
+    uart_puts_P(PSTR("Ultimo motivo: ")); puts_tab(NOME_MOT, (uint8_t)C->motivo);
+    uart_puts_P(PSTR("  Tempo: ")); put_tempo(); uart_puts_P(PSTR(" s")); uart_nl();
+    ok();
+}
+
+static void cmd_params(void)
+{
+    for (uint8_t i = 0; i < PARAMS_N; i++) {
+        uart_puts_P(PSTR("  "));
+        put_nome_param(i);
+        uart_putc('=');
+        uart_putu(params_get(P, i));
+        uart_putc(' ');
+        uart_puts_P(PDESC[i].unid);
+        uart_nl();
+    }
+    ok();
+}
+
+/* SET <nome> <valor> [<nome> <valor> ...]: todas as alteracoes sao
+ * aplicadas numa copia e validadas em conjunto; ou entram todas, ou
+ * nenhuma. Assim e possivel mover a faixa de histerese inteira de uma vez. */
+static void cmd_set(char **tok, uint8_t n)
+{
+    params_t tmp = *P;
+    if (n < 3 || (n - 1) % 2 != 0) {
+        erro(PSTR("uso: SET <nome> <valor> [<nome> <valor> ...]"));
+        return;
+    }
+    for (uint8_t i = 1; i < n; i += 2) {
+        int8_t idx = acha_param(tok[i]);
+        uint16_t v;
+        if (idx < 0) {
+            erro(PSTR("parametro desconhecido (veja PARAMS)"));
+            return;
+        }
+        if (!num_u16(tok[i + 1], &v) || v > pgm_read_word(&PDESC[idx].max)) {
+            erro(PSTR("valor fora da faixa"));
+            return;
+        }
+        params_set(&tmp, (uint8_t)idx, v);
+    }
+    param_erro_t e = params_valida(&tmp);
+    if (e != PARAM_OK) {
+        msg_validacao(e);
+        return;
+    }
+    *P = tmp;
+    ok();
+}
+
+static void cmd_cal(char **tok, uint8_t n)
+{
+    params_t tmp = *P;
+    uint16_t mm;
+    if (n != 2) {
+        erro(PSTR("uso: CAL ZERO | CAL <nivel_mm>"));
+        return;
+    }
+    if ((C->alarmes & AL_SENSOR) || C->adc < P->adc_fmin || C->adc > P->adc_fmax) {
+        erro(PSTR("sensor fora da faixa"));
+        return;
+    }
+    if (igual(tok[1], PSTR("ZERO"))) {
+        tmp.adc_zero = C->adc;
+    } else if (num_u16(tok[1], &mm) && mm > 0 && mm <= 30000) {
+        tmp.adc_ref = C->adc;
+        tmp.n_ref   = mm;
+    } else {
+        erro(PSTR("uso: CAL ZERO | CAL <nivel_mm>"));
+        return;
+    }
+    param_erro_t e = params_valida(&tmp);
+    if (e != PARAM_OK) {
+        msg_validacao(e);
+        return;
+    }
+    *P = tmp;
+    uart_puts_P(PSTR("ADCZERO=")); uart_putu(P->adc_zero);
+    uart_puts_P(PSTR(" ADCREF="));  uart_putu(P->adc_ref);
+    uart_puts_P(PSTR(" NREF="));    uart_putu(P->n_ref);
+    uart_nl();
+    ok();
+}
+
+static void executa(char **tok, uint8_t n)
+{
+    const char *c0 = tok[0];
+
+    if (igual(c0, PSTR("STATUS")) || igual(c0, PSTR("S"))) {
+        cmd_status();
+    } else if (igual(c0, PSTR("PARAMS")) || igual(c0, PSTR("P"))) {
+        cmd_params();
+    } else if (igual(c0, PSTR("SET"))) {
+        cmd_set(tok, n);
+    } else if (igual(c0, PSTR("CAL"))) {
+        cmd_cal(tok, n);
+    } else if (igual(c0, PSTR("MODO")) && n == 2) {
+        if (igual(tok[1], PSTR("AUTO")))        { ctrl_modo(C, MODO_AUTO);   ok(); }
+        else if (igual(tok[1], PSTR("MANUAL"))) { ctrl_modo(C, MODO_MANUAL); ok(); }
+        else erro(PSTR("uso: MODO AUTO | MANUAL"));
+    } else if (igual(c0, PSTR("BOMBA")) && n == 2) {
+        bool ligar;
+        if (igual(tok[1], PSTR("LIGA")))      ligar = true;
+        else if (igual(tok[1], PSTR("DESL"))) ligar = false;
+        else { erro(PSTR("uso: BOMBA LIGA | DESL")); return; }
+        if (C->modo != MODO_MANUAL)
+            erro(PSTR("disponivel apenas no modo MANUAL"));
+        else if (!ctrl_bomba_manual(C, ligar))
+            erro(PSTR("intertravamento ativo (sensor, nivel critico alto ou falha)"));
+        else
+            ok();
+    } else if (igual(c0, PSTR("ACK"))) {
+        ctrl_reconhece(C);
+        ok();
+    } else if (igual(c0, PSTR("SALVAR"))) {
+        app_salvar();
+        ok();
+    } else if (igual(c0, PSTR("CARREGAR"))) {
+        if (app_carregar()) ok();
+        else erro(PSTR("EEPROM invalida, padrao carregado"));
+    } else if (igual(c0, PSTR("PADRAO"))) {
+        params_padrao(P);
+        ok();
+    } else if (igual(c0, PSTR("VERSAO"))) {
+        uart_puts_P(PSTR("Controle de nivel ATmega328P fw " FW_VERSAO "\r\n"));
+        ok();
+    } else if (igual(c0, PSTR("AJUDA")) || igual(c0, PSTR("?")) || igual(c0, PSTR("HELP"))) {
+        uart_puts_P(AJUDA);
+        ok();
+    } else {
+        erro(PSTR("comando desconhecido (digite AJUDA)"));
+    }
+}
+
+#define MAX_TOKENS 13u                      /* SET + ate 6 pares nome/valor */
+
+static void processa_linha(void)
+{
+    char *tok[MAX_TOKENS];
+    uint8_t n = 0;
+    char *s = linha;
+
+    for (char *q = linha; *q; q++)                  /* maiusculas */
+        if (*q >= 'a' && *q <= 'z')
+            *q = (char)(*q - 'a' + 'A');
+
+    while (*s && n < MAX_TOKENS) {                          /* separa por espacos */
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        tok[n++] = s;
+        while (*s && *s != ' ' && *s != '\t') s++;
+        if (*s) *s++ = '\0';
+    }
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s) {                                       /* sobrou texto */
+        erro(PSTR("tokens demais (SET aceita ate 6 pares por linha)"));
+        return;
+    }
+    if (n)
+        executa(tok, n);
+}
+
+/* ------------------------------------------------------------------ */
+/* Interface publica                                                   */
+/* ------------------------------------------------------------------ */
+void prot_init(params_t *p, ctrl_t *c)
+{
+    P = p;
+    C = c;
+    tam = 0;
+    descartando = false;
+    ant_bomba   = c->bomba;
+    ant_estado  = c->estado;
+    ant_alarmes = c->alarmes;
+    prox_telem  = 0;
+}
+
+void prot_rx(char ch)
+{
+    if (ch == '\r' || ch == '\n') {
+        if (descartando) {
+            erro(PSTR("linha muito longa"));
+            descartando = false;
+        } else if (tam) {
+            linha[tam] = '\0';
+            processa_linha();
+        }
+        tam = 0;
+        return;
+    }
+    if (ch == 0x08 || ch == 0x7F) {                 /* backspace */
+        if (tam) tam--;
+        return;
+    }
+    if (descartando)
+        return;
+    if (tam >= PROT_LINHA_MAX) {
+        descartando = true;
+        return;
+    }
+    if (ch >= ' ' && ch <= '~')
+        linha[tam++] = ch;
+}
+
+void prot_pos_passo(void)
+{
+    /* eventos espontaneos */
+    if (C->bomba != ant_bomba || C->estado != ant_estado) {
+        uart_putc('!'); put_tempo();
+        uart_puts_P(PSTR(" BOMBA="));  uart_puts_P(C->bomba ? PSTR("LIGADA") : PSTR("DESL"));
+        uart_puts_P(PSTR(" EST="));    puts_tab(NOME_EST, (uint8_t)C->estado);
+        uart_puts_P(PSTR(" MOT="));    puts_tab(NOME_MOT, (uint8_t)C->motivo);
+        uart_puts_P(PSTR(" N="));      uart_puti(C->nivel_mm);
+        uart_nl();
+        ant_bomba  = C->bomba;
+        ant_estado = C->estado;
+    }
+    if (C->alarmes != ant_alarmes) {
+        uint8_t mudou = C->alarmes ^ ant_alarmes;
+        for (uint8_t i = 0; i < AL_N; i++) {
+            if (mudou & (1u << i)) {
+                uart_putc('!'); put_tempo();
+                uart_puts_P((C->alarmes & (1u << i)) ? PSTR(" ALARME+ ") : PSTR(" ALARME- "));
+                puts_tab(NOME_AL, i);
+                uart_puts_P(PSTR(" N=")); uart_puti(C->nivel_mm);
+                uart_nl();
+            }
+        }
+        ant_alarmes = C->alarmes;
+    }
+
+    /* telemetria periodica: #D,t,adc,nivel,pct,bomba,estado,modo,alarmes */
+    if (P->telem && C->passos >= prox_telem) {
+        prox_telem = C->passos + (uint32_t)P->telem * PASSOS_POR_S;
+        uart_puts_P(PSTR("#D,"));
+        put_tempo();                          uart_putc(',');
+        uart_putu(C->adc);                    uart_putc(',');
+        uart_puti(C->nivel_mm);               uart_putc(',');
+        uart_putu(ctrl_percentual(P, C->nivel_mm)); uart_putc(',');
+        uart_putc(C->bomba ? '1' : '0');      uart_putc(',');
+        uart_putc("DLF"[C->estado]);          uart_putc(',');
+        uart_putc(C->modo == MODO_AUTO ? 'A' : 'M'); uart_putc(',');
+        uart_puthex8(C->alarmes);
+        uart_nl();
+    }
+}
+
+void prot_boot(uint8_t causa_reset, uint8_t params_da_eeprom)
+{
+    static const char s_rs0[] PROGMEM = "PWR";
+    static const char s_rs1[] PROGMEM = "EXT";
+    static const char s_rs2[] PROGMEM = "BOD";
+    static const char s_rs3[] PROGMEM = "WDT";
+    static const char * const NOME_RS[] PROGMEM = { s_rs0, s_rs1, s_rs2, s_rs3 };
+
+    uart_puts_P(PSTR("\r\n!0.0 BOOT fw=" FW_VERSAO " reset="));
+    bool algum = false;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (causa_reset & (1u << i)) {
+            if (algum) uart_putc('|');
+            puts_tab(NOME_RS, i);
+            algum = true;
+        }
+    }
+    if (!algum) uart_putc('-');
+    uart_puts_P(params_da_eeprom ? PSTR(" params=EEPROM") : PSTR(" params=PADRAO"));
+    uart_nl();
+    if (causa_reset & (1u << 3))
+        uart_puts_P(PSTR("!0.0 ALERTA reinicio pelo watchdog\r\n"));
+    if (causa_reset & (1u << 2))
+        uart_puts_P(PSTR("!0.0 ALERTA reinicio por subtensao (brown-out)\r\n"));
+}
+
+void prot_botao(void)
+{
+    ctrl_reconhece(C);
+    uart_putc('!'); put_tempo();
+    uart_puts_P(PSTR(" ACK botao local\r\n"));
+}
+
+/*
+ * protocolo.h - Interface serial com o operador
+ *
+ * Linhas recebidas (terminadas em CR e/ou LF, maiusculas ou minusculas)
+ * sao interpretadas como comandos. O sistema envia:
+ *   - respostas aos comandos, terminadas em "OK" ou "ERRO: ...";
+ *   - eventos espontaneos, iniciados por '!' (mudanca da bomba, alarmes);
+ *   - telemetria periodica, iniciada por "#D," (formato CSV).
+ */
+#ifndef PROTOCOLO_H
+#define PROTOCOLO_H
+
+#include <stdint.h>
+#include "params.h"
+#include "controle.h"
+
+#define PROT_LINHA_MAX 64u
+
+void prot_init(params_t *p, ctrl_t *c);
+void prot_rx(char ch);          /* alimenta um byte recebido            */
+void prot_pos_passo(void);      /* eventos + telemetria, a cada 100 ms  */
+void prot_boot(uint8_t causa_reset, uint8_t params_da_eeprom);
+void prot_botao(void);          /* reconhecimento pelo botao local      */
+
+/* Fornecidas pela aplicacao (main.c) ou pelos testes */
+void    app_salvar(void);
+uint8_t app_carregar(void);     /* 1 se a EEPROM era valida */
+
+#endif
+
+/*
+ * timer.c - Base de tempo do sistema com o Timer/Counter1 em modo CTC
+ *
+ * f_tick = F_CPU / (N * (1 + OCR1A)) = 16 MHz / (64 * 2500) = 100 Hz
+ *
+ * A ISR de 10 ms faz apenas o trabalho que precisa de periodicidade
+ * exata: dispara a conversao do ADC, amostra o botao e sinaliza ao laco
+ * principal que um passo de controle (100 ms) venceu. O processamento
+ * pesado fica fora da interrupcao.
+ */
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include "config.h"
+#include "board.h"
+#include "timer.h"
+
+#define TIMER1_PRESC    64u
+#define TIMER1_TOPO     ((F_CPU / (TIMER1_PRESC * TICK_HZ)) - 1u)   /* 2499 */
+
+#if TIMER1_TOPO > 65535u
+#error "TIMER1_TOPO nao cabe em 16 bits"
+#endif
+
+static volatile uint8_t passos_pendentes;
+static volatile uint8_t evento_botao;
+
+void timer_init(void)
+{
+    OCR1A  = TIMER1_TOPO;
+    TCCR1A = 0;
+    TCCR1B = (1 << WGM12);                  /* CTC, topo = OCR1A */
+    TCNT1  = 0;
+    TIFR1  = (1 << OCF1A);                  /* limpa flag pendente */
+    TIMSK1 = (1 << OCIE1A);                 /* interrupcao de comparacao A */
+    TCCR1B |= (1 << CS11) | (1 << CS10);    /* prescaler 64: inicia contagem */
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    static uint8_t div_passo;
+    static uint8_t cont_botao;
+    static uint8_t botao_estavel;
+
+    /* 1) Dispara uma conversao do ADC (100 amostras/s).
+     * ADIF e "limpo escrevendo 1": um ADCSRA |= (1<<ADSC) poderia apagar
+     * uma conversao concluida e ainda nao atendida. Por isso ADIF e
+     * escrito com 0 explicitamente. */
+    ADCSRA = (uint8_t)((ADCSRA & ~(1 << ADIF)) | (1 << ADSC));
+
+    /* 2) Debounce do botao por integracao: o estado so muda apos
+     * BOTAO_DEBOUNCE leituras consecutivas iguais (50 ms). */
+    uint8_t lido = botao_pressionado();
+    if (lido != botao_estavel) {
+        if (++cont_botao >= BOTAO_DEBOUNCE) {
+            botao_estavel = lido;
+            cont_botao = 0;
+            if (lido)
+                evento_botao = 1;           /* borda de pressionamento */
+        }
+    } else {
+        cont_botao = 0;
+    }
+
+    /* 3) Divisor para o passo de controle de 100 ms */
+    if (++div_passo >= TICKS_POR_PASSO) {
+        div_passo = 0;
+        if (passos_pendentes < 255)
+            passos_pendentes++;
+    }
+}
+
+uint8_t timer_pega_passo(void)
+{
+    uint8_t tem = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (passos_pendentes) {
+            passos_pendentes--;
+            tem = 1;
+        }
+    }
+    return tem;
+}
+
+uint8_t timer_ha_trabalho(void)
+{
+    return passos_pendentes != 0 || evento_botao != 0;
+}
+
+uint8_t timer_pega_botao(void)
+{
+    uint8_t ev;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        ev = evento_botao;
+        evento_botao = 0;
+    }
+    return ev;
+}
+
+#ifndef TIMER_H
+#define TIMER_H
+
+#include <stdint.h>
+
+void    timer_init(void);
+uint8_t timer_pega_passo(void);    /* 1 se um passo de 100 ms esta pendente */
+uint8_t timer_pega_botao(void);    /* 1 se o botao foi pressionado          */
+uint8_t timer_ha_trabalho(void);   /* chamado com interrupcoes desabilitadas */
+
+#endif
+
+/*
+ * uart.c - USART0 com recepcao e transmissao por interrupcao
+ *
+ * RX: a ISR USART_RX_vect guarda cada byte num buffer circular; o laco
+ *     principal monta as linhas de comando sem nunca esperar pela serial.
+ * TX: uart_putc so copia o byte para o buffer circular e habilita a
+ *     interrupcao "registrador de dados vazio" (UDRE). A ISR envia um
+ *     byte por vez e se desabilita quando o buffer esvazia. Assim, uma
+ *     resposta longa nao atrasa a aquisicao nem o controle.
+ *
+ * Buffers produtor/consumidor de um so produtor e um so consumidor:
+ * cada indice e escrito por um unico contexto e tem 8 bits (acesso
+ * atomico no AVR), dispensando secoes criticas.
+ */
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include "config.h"
+#include "uart.h"
+
+#define UBRR_VALOR  ((F_CPU / (8UL * UART_BAUD)) - 1UL)   /* U2X = 1 -> 51 */
+
+static volatile uint8_t rx_buf[UART_RX_TAM];
+static volatile uint8_t rx_ini, rx_fim;
+static volatile uint8_t rx_estouro;
+
+static volatile uint8_t tx_buf[UART_TX_TAM];
+static volatile uint8_t tx_ini, tx_fim;    /* 8 bits: volta sozinho em 256 */
+
+void uart_init(void)
+{
+    UBRR0H = (uint8_t)(UBRR_VALOR >> 8);
+    UBRR0L = (uint8_t)UBRR_VALOR;
+    UCSR0A = (1 << U2X0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);               /* 8N1 */
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+}
+
+ISR(USART_RX_vect)
+{
+    uint8_t d = UDR0;
+    uint8_t prox = (uint8_t)((rx_fim + 1u) & (UART_RX_TAM - 1u));
+    if (prox != rx_ini) {
+        rx_buf[rx_fim] = d;
+        rx_fim = prox;
+    } else {
+        rx_estouro = 1;
+    }
+}
+
+ISR(USART_UDRE_vect)
+{
+    if (tx_ini != tx_fim) {
+        UDR0 = tx_buf[tx_ini];
+        tx_ini++;
+    } else {
+        UCSR0B &= (uint8_t)~(1 << UDRIE0);  /* nada a enviar */
+    }
+}
+
+int uart_getc(void)
+{
+    uint8_t d;
+    if (rx_ini == rx_fim)
+        return -1;
+    d = rx_buf[rx_ini];
+    rx_ini = (uint8_t)((rx_ini + 1u) & (UART_RX_TAM - 1u));
+    return d;
+}
+
+void uart_putc(char c)
+{
+    uint8_t prox = (uint8_t)(tx_fim + 1u);
+    while (prox == tx_ini)
+        ;                                   /* buffer cheio: a ISR esvazia */
+    tx_buf[tx_fim] = (uint8_t)c;
+    tx_fim = prox;
+    UCSR0B |= (1 << UDRIE0);
+}
+
+uint8_t uart_estouro_rx(void)
+{
+    uint8_t e = rx_estouro;
+    rx_estouro = 0;
+    return e;
+}
+
+#ifndef UART_H
+#define UART_H
+
+#include <stdint.h>
+
+void uart_init(void);
+int  uart_getc(void);                 /* -1 se nao ha byte recebido */
+void uart_putc(char c);               /* bloqueia so se o buffer de TX encher */
+void uart_puts(const char *s);        /* string na RAM   */
+void uart_puts_P(const char *s);      /* string na flash (PSTR) */
+void uart_putu(uint32_t v);
+void uart_puti(int32_t v);
+void uart_putd1(uint32_t decimos);    /* 1234 -> "123.4" */
+void uart_puthex8(uint8_t v);
+void uart_nl(void);
+uint8_t uart_estouro_rx(void);        /* 1 se bytes foram perdidos (e limpa) */
+
+#endif
+
+/*
+ * uart_fmt.c - Formatacao numerica leve (sem printf) sobre uart_putc.
+ * Independente de hardware: compilado tambem nos testes no PC.
+ */
+#include "uart.h"
+#include "pgm_compat.h"
+
+void uart_puts(const char *s)
+{
+    while (*s)
+        uart_putc(*s++);
+}
+
+void uart_puts_P(const char *s)
+{
+    char c;
+    while ((c = (char)pgm_read_byte(s++)) != 0)
+        uart_putc(c);
+}
+
+void uart_putu(uint32_t v)
+{
+    char buf[11];
+    uint8_t i = 0;
+    do {
+        buf[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v);
+    while (i)
+        uart_putc(buf[--i]);
+}
+
+void uart_puti(int32_t v)
+{
+    if (v < 0) {
+        uart_putc('-');
+        uart_putu((uint32_t)(-v));
+    } else {
+        uart_putu((uint32_t)v);
+    }
+}
+
+void uart_putd1(uint32_t decimos)
+{
+    uart_putu(decimos / 10u);
+    uart_putc('.');
+    uart_putc((char)('0' + decimos % 10u));
+}
+
+void uart_puthex8(uint8_t v)
+{
+    static const char hex[] PROGMEM = "0123456789ABCDEF";
+    uart_putc((char)pgm_read_byte(&hex[v >> 4]));
+    uart_putc((char)pgm_read_byte(&hex[v & 0x0F]));
+}
+
+void uart_nl(void)
+{
+    uart_putc('\r');
+    uart_putc('\n');
+}
